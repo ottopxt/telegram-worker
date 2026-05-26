@@ -1,203 +1,154 @@
 """
-Telegram MTProto Worker
-- Lê telegram_sessions pendentes e completa login (phone -> code)
-- Para sessoes ativas, escuta mensagens dos bots monitorados (telegram_monitored_bots)
-- Extrai CPFs das mensagens e salva em telegram_captures
+Telegram MTProto worker for PROSPERITY AND LOYALTY GROUP
+Listens to monitored bots, extracts CPFs from messages, sends to Lovable Cloud
+via the worker-bridge edge function (no SUPABASE_SERVICE_ROLE_KEY required).
 """
 import asyncio
 import os
 import re
 import logging
+from typing import Any, Dict, List
+
+import httpx
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
-from supabase import create_client, Client
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("worker")
-
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
+BRIDGE_URL = os.environ["BRIDGE_URL"].rstrip("/")
+WORKER_SECRET = os.environ["WORKER_SHARED_SECRET"]
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
 
-sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+CPF_RE = re.compile(r"\b(\d{3}\.?\d{3}\.?\d{3}-?\d{2})\b")
 
-# session_id -> {"client": TelegramClient, "user_id": uuid}
-active_clients: dict[str, dict] = {}
-
-CPF_REGEX = re.compile(r"\b(\d{3}\.?\d{3}\.?\d{3}-?\d{2})\b")
-
-
-def extract_cpf(text: str) -> str | None:
-    if not text:
-        return None
-    m = CPF_REGEX.search(text)
-    if not m:
-        return None
-    return re.sub(r"\D", "", m.group(1))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("worker")
 
 
-async def handle_pending_session(row: dict):
-    """status='pending' -> envia codigo. status='code_sent' -> confirma codigo."""
-    sid = row["id"]
-    user_id = row["user_id"]
-    phone = row["phone"]
-    status = row["status"]
+async def bridge(action: str, **kwargs) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            BRIDGE_URL,
+            headers={
+                "Content-Type": "application/json",
+                "x-worker-secret": WORKER_SECRET,
+            },
+            json={"action": action, **kwargs},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+def normalize_cpf(s: str) -> str:
+    return re.sub(r"\D", "", s)
+
+
+# Currently active Telethon clients indexed by user_id
+running: Dict[str, asyncio.Task] = {}
+
+
+async def run_session(session_info: Dict[str, Any]):
+    user_id = session_info["user_id"]
+    bots = {int(b["bot_id"]): b for b in session_info.get("bots", [])}
+    if not bots:
+        log.info("user %s has no active bots, skipping", user_id)
+        return
+
+    client = TelegramClient(
+        StringSession(session_info["session_string"]),
+        API_ID,
+        API_HASH,
+    )
 
     try:
-        if status == "pending":
-            log.info(f"[{sid}] enviando codigo para {phone}")
-            client = TelegramClient(StringSession(), API_ID, API_HASH)
-            await client.connect()
-            sent = await client.send_code_request(phone)
-            session_str = client.session.save()
-            sb.table("telegram_sessions").update({
-                "status": "code_sent",
-                "phone_code_hash": sent.phone_code_hash,
-                "session_string": session_str,
-                "last_error": None,
-            }).eq("id", sid).execute()
-            await client.disconnect()
+        await client.connect()
+        if not await client.is_user_authorized():
+            log.warning("session for %s not authorized, marking error", user_id)
+            await bridge("update_session", user_id=user_id,
+                         status="error", last_error="not authorized")
+            return
 
-        elif status == "code_submitted":
-            # codigo deve estar em last_error (campo reusado) ou outra coluna
-            # Aqui assumimos que o front grava o codigo em "phone_code_hash" como "hash|codigo"
-            # ou usamos um campo dedicado. Por simplicidade lemos de last_error temporariamente.
-            code = row.get("last_error")  # frontend grava o codigo aqui
-            session_str = row.get("session_string")
-            phone_code_hash = row.get("phone_code_hash")
-            if not (code and session_str and phone_code_hash):
-                return
+        log.info("listening for %s on bots %s", user_id, list(bots.keys()))
 
-            client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-            await client.connect()
+        @client.on(events.NewMessage(chats=list(bots.keys())))
+        async def handler(event):
             try:
-                await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
-            except SessionPasswordNeededError:
-                sb.table("telegram_sessions").update({
-                    "status": "error",
-                    "last_error": "Conta com 2FA nao suportada",
-                }).eq("id", sid).execute()
-                await client.disconnect()
-                return
-            except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
-                sb.table("telegram_sessions").update({
-                    "status": "pending",
-                    "last_error": f"Codigo invalido: {e}",
-                }).eq("id", sid).execute()
-                await client.disconnect()
-                return
+                text = event.message.message or ""
+                cpfs = CPF_RE.findall(text)
+                if not cpfs:
+                    return
+                bot_id = event.chat_id
+                bot_meta = bots.get(bot_id, {})
+                rows = [
+                    {
+                        "user_id": user_id,
+                        "bot_id": bot_id,
+                        "bot_username": bot_meta.get("bot_username"),
+                        "cpf": normalize_cpf(c),
+                        "message_text": text[:2000],
+                        "message_id": event.message.id,
+                    }
+                    for c in set(cpfs)
+                ]
+                await bridge("insert_captures_bulk", rows=rows)
+                log.info("captured %d CPF(s) for %s from bot %s",
+                         len(rows), user_id, bot_id)
+            except Exception as exc:
+                log.exception("handler error: %s", exc)
 
-            me = await client.get_me()
-            new_session = client.session.save()
-            sb.table("telegram_sessions").update({
-                "status": "active",
-                "session_string": new_session,
-                "telegram_user_id": me.id,
-                "last_error": None,
-                "phone_code_hash": None,
-            }).eq("id", sid).execute()
-            await client.disconnect()
-            log.info(f"[{sid}] login OK user={me.id}")
-
-    except Exception as e:
-        log.exception(f"[{sid}] erro: {e}")
-        sb.table("telegram_sessions").update({
-            "status": "error",
-            "last_error": str(e)[:500],
-        }).eq("id", sid).execute()
-
-
-async def start_active_session(row: dict):
-    sid = row["id"]
-    user_id = row["user_id"]
-    session_str = row["session_string"]
-    if sid in active_clients:
-        return
-
-    log.info(f"[{sid}] iniciando listener")
-    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-    await client.connect()
-    if not await client.is_user_authorized():
-        log.warning(f"[{sid}] nao autorizada, marcando como error")
-        sb.table("telegram_sessions").update({
-            "status": "error", "last_error": "Sessao expirou"
-        }).eq("id", sid).execute()
-        await client.disconnect()
-        return
-
-    # pega bots monitorados deste user
-    bots = sb.table("telegram_monitored_bots").select("bot_id,bot_username").eq(
-        "user_id", user_id).eq("active", True).execute().data
-    bot_ids = {b["bot_id"] for b in bots}
-    bot_map = {b["bot_id"]: b.get("bot_username") for b in bots}
-
-    @client.on(events.NewMessage(incoming=True))
-    async def handler(event):
-        sender_id = event.sender_id
-        if sender_id not in bot_ids:
-            return
-        text = event.raw_text or ""
-        cpf = extract_cpf(text)
-        if not cpf:
-            return
+        await client.run_until_disconnected()
+    except Exception as exc:
+        log.exception("session %s crashed: %s", user_id, exc)
         try:
-            sb.table("telegram_captures").insert({
-                "user_id": user_id,
-                "bot_id": sender_id,
-                "bot_username": bot_map.get(sender_id),
-                "cpf": cpf,
-                "message_id": event.id,
-                "message_text": text[:2000],
-            }).execute()
-            log.info(f"[{sid}] CPF capturado: {cpf} bot={sender_id}")
-        except Exception as e:
-            log.error(f"[{sid}] falha ao salvar: {e}")
-
-    active_clients[sid] = {"client": client, "user_id": user_id}
-    asyncio.create_task(client.run_until_disconnected())
+            await bridge("update_session", user_id=user_id,
+                         status="error", last_error=str(exc)[:500])
+        except Exception:
+            pass
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
 
 
-async def poll_loop():
+async def supervisor():
     while True:
         try:
-            # 1) pendentes (envio de codigo + confirmacao)
-            pend = sb.table("telegram_sessions").select("*").in_(
-                "status", ["pending", "code_submitted"]).execute().data
-            for row in pend:
-                await handle_pending_session(row)
+            data = await bridge("list_active_sessions")
+            sessions = data.get("sessions", [])
+            wanted = {s["user_id"] for s in sessions}
 
-            # 2) ativas (start listener)
-            act = sb.table("telegram_sessions").select("*").eq("status", "active").execute().data
-            active_ids = {r["id"] for r in act}
-            for row in act:
-                if row["id"] not in active_clients:
-                    await start_active_session(row)
+            # stop sessions that no longer exist
+            for uid in list(running.keys()):
+                if uid not in wanted:
+                    log.info("stopping session for %s", uid)
+                    running[uid].cancel()
+                    running.pop(uid, None)
 
-            # 3) sessoes que sairam de active -> desconectar
-            for sid in list(active_clients.keys()):
-                if sid not in active_ids:
-                    log.info(f"[{sid}] desconectando")
-                    try:
-                        await active_clients[sid]["client"].disconnect()
-                    except Exception:
-                        pass
-                    active_clients.pop(sid, None)
-
-        except Exception as e:
-            log.exception(f"poll error: {e}")
+            # start new sessions
+            for s in sessions:
+                uid = s["user_id"]
+                if uid not in running or running[uid].done():
+                    log.info("starting session for %s", uid)
+                    running[uid] = asyncio.create_task(run_session(s))
+        except Exception as exc:
+            log.exception("supervisor error: %s", exc)
 
         await asyncio.sleep(POLL_INTERVAL)
 
 
 async def main():
-    log.info("Worker iniciado")
-    await poll_loop()
+    log.info("worker starting, bridge=%s", BRIDGE_URL)
+    # quick health check
+    pong = await bridge("ping")
+    log.info("bridge ping: %s", pong)
+    await supervisor()
 
 
 if __name__ == "__main__":

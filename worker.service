@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram MTProto Worker
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/telegram-worker/worker
+EnvironmentFile=/root/telegram-worker/worker/.env
+ExecStart=/root/telegram-worker/worker/venv/bin/python /root/telegram-worker/worker/worker.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/telegram-worker.log
+StandardError=append:/var/log/telegram-worker.log
+
+[Install]
+WantedBy=multi-user.target
